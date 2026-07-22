@@ -8,9 +8,10 @@ from einops import rearrange
 from timm.models.layers import to_2tuple, trunc_normal_
 
 
-def shift_back(inputs, step=2):
+def shift_back(inputs, step=2, down_sample=None):
     bs, nC, row, col = inputs.shape
-    down_sample = 256 // row
+    if down_sample is None:
+        down_sample = max(1, 256 // row)
     step = float(step) / float(down_sample * down_sample)
     output = torch.zeros_like(inputs)
     for i in range(nC):
@@ -22,13 +23,22 @@ def shift_back(inputs, step=2):
 
 def window_partition(x, window_size):
     B, H, W, C = x.shape
+    if H % window_size != 0 or W % window_size != 0:
+        raise ValueError(f"Feature size {(H, W)} must be divisible by window_size={window_size}.")
     x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
     windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
     return windows
 
 
 def window_reverse(windows, window_size, H, W):
-    B = int(windows.shape[0] / (H * W / window_size / window_size))
+    if H % window_size != 0 or W % window_size != 0:
+        raise ValueError(f"Feature size {(H, W)} must be divisible by window_size={window_size}.")
+    windows_per_image = (H // window_size) * (W // window_size)
+    if windows.shape[0] % windows_per_image != 0:
+        raise ValueError(
+            f"Cannot reverse {windows.shape[0]} windows into {(H, W)} with window_size={window_size}."
+        )
+    B = windows.shape[0] // windows_per_image
     x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
     return x
@@ -36,6 +46,8 @@ def window_reverse(windows, window_size, H, W):
 
 def window_partition_channels_first(x, window_size):
     B, C, H, W = x.shape
+    if H % window_size != 0 or W % window_size != 0:
+        raise ValueError(f"Feature size {(H, W)} must be divisible by window_size={window_size}.")
     x = x.view(B, C, H // window_size, window_size, W // window_size, window_size)
     windows = x.permute(0, 2, 4, 1, 3, 5).contiguous().view(-1, C, window_size, window_size)
     return windows
@@ -145,6 +157,10 @@ class SwinTransformerBlock(nn.Module):
         self.num_heads = num_heads
         self.window_size = window_size
         self.shift_size = shift_size
+        if any(size % self.window_size != 0 for size in self.input_resolution):
+            raise ValueError(
+                f"Configured resolution {self.input_resolution} must be divisible by window_size={self.window_size}."
+            )
         self.norm1 = nn.LayerNorm(dim)
         self.attn = WindowAttention(dim, window_size=to_2tuple(window_size), num_heads=num_heads)
         self.norm2 = nn.LayerNorm(dim)
@@ -171,6 +187,11 @@ class SwinTransformerBlock(nn.Module):
     def forward(self, x):
         H, W = self.input_resolution
         B, H_in, W_in, C = x.shape
+        if (H_in, W_in) != (H, W):
+            raise ValueError(
+                f"Swin block was configured for {(H, W)}, but received {(H_in, W_in)}. "
+                "Pass the model input_resolution through the spatial hierarchy."
+            )
         shortcut = x
         x = self.norm1(x)
         if self.shift_size > 0:
@@ -192,8 +213,9 @@ class SwinTransformerBlock(nn.Module):
 
 
 class MGA(nn.Module):
-    def __init__(self, n_feat):
+    def __init__(self, n_feat, down_sample=1):
         super().__init__()
+        self.down_sample = int(down_sample)
         self.conv1 = nn.Conv2d(n_feat, n_feat, kernel_size=1, bias=True)
         self.conv2 = nn.Conv2d(n_feat, n_feat, kernel_size=1, bias=True)
         self.depth_conv = nn.Conv2d(n_feat, n_feat, kernel_size=5, padding=2, bias=True, groups=n_feat)
@@ -202,7 +224,7 @@ class MGA(nn.Module):
         mask_shifted = self.conv1(mask_shifted)
         mask_gate = torch.sigmoid(self.depth_conv(self.conv2(mask_shifted)))
         mask_shifted = mask_shifted * mask_gate + mask_shifted
-        return shift_back(mask_shifted)
+        return shift_back(mask_shifted, down_sample=self.down_sample)
 
 
 class LocalResidualRefiner(nn.Module):
@@ -224,11 +246,21 @@ class LocalResidualRefiner(nn.Module):
 
 
 class SSHM(nn.Module):
-    def __init__(self, dim, stage=1, mode="full"):
+    def __init__(self, dim, stage=1, mode="full", input_resolution=256):
         super().__init__()
         self.mode = str(mode).lower().strip()
         self.local_refiner = LocalResidualRefiner(dim)
-        input_resolution = 256 // (2 ** stage)
+        input_resolution = int(input_resolution)
+        stage_divisor = 2 ** int(stage)
+        if input_resolution % stage_divisor != 0:
+            raise ValueError(
+                f"input_resolution={input_resolution} must be divisible by the stage factor {stage_divisor}."
+            )
+        input_resolution //= stage_divisor
+        if input_resolution % 8 != 0:
+            raise ValueError(
+                f"Stage-{stage} resolution {input_resolution} must be divisible by both SSHM window sizes 4 and 8."
+            )
         num_heads = 2 ** stage
         self.swa4_w = self.swa4_sw = self.swa8_w = self.swa8_sw = None
         if self.mode in {"full", "w_only"}:
@@ -275,8 +307,9 @@ class SSHM(nn.Module):
 
 
 class SpatialAttentionBlock(nn.Module):
-    def __init__(self, dim, dim_head=64, heads=8, stage_level=0, sshm_mode="full"):
+    def __init__(self, dim, dim_head=64, heads=8, stage_level=0, sshm_mode="full", input_resolution=256):
         super().__init__()
+        self.down_sample = 2 ** int(stage_level)
         self.num_heads = heads
         self.dim_head = dim_head
         self.to_q = nn.Linear(dim, dim_head * heads, bias=False)
@@ -289,8 +322,8 @@ class SpatialAttentionBlock(nn.Module):
             GELU(),
             nn.Conv2d(dim, dim, 3, 1, 1, bias=False, groups=dim),
         )
-        self.mga = MGA(dim)
-        self.sshm = SSHM(dim, stage=stage_level, mode=sshm_mode)
+        self.mga = MGA(dim, down_sample=self.down_sample)
+        self.sshm = SSHM(dim, stage=stage_level, mode=sshm_mode, input_resolution=input_resolution)
         self.dw11 = LocalResidualRefiner(dim)
         self.spatial_gate_conv = nn.Conv2d(dim, dim, 5, 1, 2, groups=dim, bias=False)
         self.attention_type = "full"
@@ -302,7 +335,7 @@ class SpatialAttentionBlock(nn.Module):
         x_spatial_restored = self.dw11(x_spatial_restored)
         x_spatial_gate = self.spatial_gate_conv(mask.permute(0, 3, 1, 2)) + mask.permute(0, 3, 1, 2)
         if x_spatial_gate.shape[3] != x_spatial_restored.shape[3]:
-            x_spatial_gate = shift_back(x_spatial_gate)
+            x_spatial_gate = shift_back(x_spatial_gate, down_sample=self.down_sample)
         x = (x_spatial_restored * x_spatial_gate).permute(0, 2, 3, 1).reshape(b, h * w, c)
         q_proj = self.to_q(x)
         k_proj = self.to_k(x)
@@ -328,13 +361,20 @@ class SpatialAttentionBlock(nn.Module):
 
 
 class SpatialOnlyBlock(nn.Module):
-    def __init__(self, dim, dim_head, heads, num_blocks, stage_level, sshm_mode):
+    def __init__(self, dim, dim_head, heads, num_blocks, stage_level, sshm_mode, input_resolution=256):
         super().__init__()
         self.blocks = nn.ModuleList(
             [
                 nn.ModuleList(
                     [
-                        SpatialAttentionBlock(dim=dim, dim_head=dim_head, heads=heads, stage_level=stage_level, sshm_mode=sshm_mode),
+                        SpatialAttentionBlock(
+                            dim=dim,
+                            dim_head=dim_head,
+                            heads=heads,
+                            stage_level=stage_level,
+                            sshm_mode=sshm_mode,
+                            input_resolution=input_resolution,
+                        ),
                         PreNorm(dim, FeedForward(dim=dim)),
                     ]
                 )
@@ -410,6 +450,7 @@ class SpatialOnlyUNet(nn.Module):
         super().__init__()
         self.dim = int(dim)
         self.stage = int(stage)
+        self.input_resolution = int(input_resolution)
         if num_blocks is None:
             num_blocks = [1] * (self.stage + 1)
         if len(num_blocks) != self.stage + 1:
@@ -428,14 +469,30 @@ class SpatialOnlyUNet(nn.Module):
             self.encoder_layers.append(
                 nn.ModuleList(
                     [
-                        SpatialOnlyBlock(dim_stage, self.dim, dim_stage // self.dim, num_blocks[i], i, "w_only"),
+                        SpatialOnlyBlock(
+                            dim_stage,
+                            self.dim,
+                            dim_stage // self.dim,
+                            num_blocks[i],
+                            i,
+                            "w_only",
+                            input_resolution=self.input_resolution,
+                        ),
                         nn.Conv2d(dim_stage, dim_stage * 2, 4, 2, 1, bias=False),
                         nn.Conv2d(dim_stage, dim_stage * 2, 4, 2, 1, bias=False),
                     ]
                 )
             )
             dim_stage *= 2
-        self.bottleneck = SpatialOnlyBlock(dim_stage, self.dim, dim_stage // self.dim, num_blocks[-1], self.stage, "w_only")
+        self.bottleneck = SpatialOnlyBlock(
+            dim_stage,
+            self.dim,
+            dim_stage // self.dim,
+            num_blocks[-1],
+            self.stage,
+            "w_only",
+            input_resolution=self.input_resolution,
+        )
         self.decoder_layers = nn.ModuleList([])
         for i in range(self.stage):
             out_dim = dim_stage // 2
@@ -444,7 +501,15 @@ class SpatialOnlyUNet(nn.Module):
                     [
                         nn.ConvTranspose2d(dim_stage, out_dim, kernel_size=2, stride=2, bias=False),
                         nn.Conv2d(dim_stage, out_dim, 1, 1, bias=False),
-                        SpatialOnlyBlock(out_dim, self.dim, out_dim // self.dim, num_blocks[self.stage - 1 - i], self.stage - 1 - i, "sw_only"),
+                        SpatialOnlyBlock(
+                            out_dim,
+                            self.dim,
+                            out_dim // self.dim,
+                            num_blocks[self.stage - 1 - i],
+                            self.stage - 1 - i,
+                            "sw_only",
+                            input_resolution=self.input_resolution,
+                        ),
                     ]
                 )
             )
