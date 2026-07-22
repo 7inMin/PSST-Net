@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.log
+.idea/
+.vscode/
+
+# Datasets are downloaded separately.
+datasets/cave_1024_28/
+datasets/CAVE_512_28/
+datasets/KAIST_CVPR2021/
+datasets/TSA_simu_data/
+datasets/TSA_real_data/
+
+# Training and testing artifacts.
+**/exp/
+**/checkpoints/
+**/results/
+*.pth
+*.pt
