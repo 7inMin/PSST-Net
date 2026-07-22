@@ -21,10 +21,15 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from architecture.PSST_Net import RealSSLT93  # noqa: E402
+
+
+SUPPORTED_CUBE_SUFFIXES = {".mat", ".npy"}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train SSLT_93 from scratch for real CASSI")
-    parser.add_argument("--cave-path", required=True, help="Directory containing CAVE .mat cubes")
-    parser.add_argument("--kaist-path", required=True, help="Directory containing KAIST .mat cubes")
+    parser.add_argument("--cave-path", required=True, help="Directory containing CAVE .mat/.npy cubes")
+    parser.add_argument("--kaist-path", required=True, help="Directory containing KAIST .mat/.npy cubes")
     parser.add_argument("--mask-path", required=True, help="Real-system mask.mat")
     parser.add_argument("--output-dir", default=str(REAL_DIR / "checkpoints"))
     parser.add_argument("--gpu", default="0")
@@ -33,8 +38,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--samples-per-epoch", type=int, default=1250,
                         help="DSMT default for a 384 patch: 20000 / (384 / 96)^2")
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--workers", type=int, default=0,
-                        help="Keep 0 on Windows to avoid duplicating large HSI arrays")
+    parser.add_argument("--workers", type=int, default=4,
+                        help="Data-loading processes; use 0 on Windows or low-RAM hosts")
     parser.add_argument("--learning-rate", type=float, default=4e-4)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--patch-size", type=int, default=384, choices=(384,))
@@ -52,14 +57,23 @@ def parse_args() -> argparse.Namespace:
 
 def _read_cube(path_string: str) -> np.ndarray:
     path = Path(path_string)
-    data = sio.loadmat(path)
-    for key in ("data_slice", "HSI", "hsi", "cube"):
-        if key in data:
-            cube = np.asarray(data[key], dtype=np.float32).squeeze()
-            break
+    if path.suffix.lower() == ".npy":
+        array = np.load(path, mmap_mode="r", allow_pickle=False)
+        source_dtype = array.dtype
+        cube = np.asarray(
+            array, dtype=np.float32
+        ).squeeze()
+    elif path.suffix.lower() == ".mat":
+        data = sio.loadmat(path)
+        for key in ("data_slice", "HSI", "hsi", "cube"):
+            if key in data:
+                cube = np.asarray(data[key], dtype=np.float32).squeeze()
+                break
+        else:
+            visible = sorted(key for key in data if not key.startswith("__"))
+            raise KeyError(f"{path}: no hyperspectral cube found; variables: {visible}")
     else:
-        visible = sorted(key for key in data if not key.startswith("__"))
-        raise KeyError(f"{path}: no hyperspectral cube found; variables: {visible}")
+        raise ValueError(f"Unsupported cube format: {path.suffix}")
     if cube.ndim != 3:
         raise ValueError(f"{path}: expected a 3-D cube, got {cube.shape}")
     if cube.shape[0] == 28 and cube.shape[-1] != 28:
@@ -67,7 +81,10 @@ def _read_cube(path_string: str) -> np.ndarray:
     if cube.shape[-1] != 28:
         raise ValueError(f"{path}: expected 28 bands on one axis, got {cube.shape}")
     if float(cube.max()) > 1.5:
-        cube = cube / 65535.0
+        if path.suffix.lower() == ".npy" and np.issubdtype(source_dtype, np.integer):
+            cube = cube / float(np.iinfo(source_dtype).max)
+        else:
+            cube = cube / 65535.0
     return np.clip(cube, 0.0, 1.0).astype(np.float32, copy=False)
 
 
@@ -83,9 +100,14 @@ class RealDomainDataset(Dataset):
     def __init__(self, cave_path: str, kaist_path: str, mask_path: str, samples: int,
                  patch_size: int, exposure_scale: float, qe: float, bit_depth: int,
                  cache_cubes: int):
-        self.files = sorted(Path(cave_path).glob("*.mat")) + sorted(Path(kaist_path).glob("*.mat"))
+        self.files = sorted(
+            path
+            for root in (Path(cave_path), Path(kaist_path))
+            for path in root.iterdir()
+            if path.is_file() and path.suffix.lower() in SUPPORTED_CUBE_SUFFIXES
+        )
         if not self.files:
-            raise FileNotFoundError("No CAVE/KAIST .mat cubes were found")
+            raise FileNotFoundError("No root-level CAVE/KAIST .mat or .npy cubes were found")
         mask_data = sio.loadmat(mask_path)
         if "mask" not in mask_data:
             raise KeyError(f"{mask_path} does not contain `mask`")

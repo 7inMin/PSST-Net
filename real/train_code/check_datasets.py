@@ -1,7 +1,7 @@
-"""Check whether CAVE and KAIST folders are compatible with real/train_code/train.py.
+"""Check whether CAVE and KAIST MAT/NPY cubes work with real training.
 
 This script is intentionally independent of PyTorch and the PSST-Net model. By
-default it only reads MATLAB metadata, so a large hyperspectral cube is not
+default it only reads MAT/NPY metadata, so a large hyperspectral cube is not
 loaded into RAM. Use ``--load-sample`` only when a full read test is required.
 """
 
@@ -17,6 +17,7 @@ import scipy.io as sio
 
 
 SUPPORTED_KEYS = ("data_slice", "HSI", "hsi", "cube")
+SUPPORTED_SUFFIXES = {".mat", ".npy"}
 DEFAULT_CAVE_PATH = Path(r"G:\Adata2\CAVE_512_28")
 DEFAULT_KAIST_PATH = Path(r"G:\Adata2\KAIST_CVPR2021")
 
@@ -57,6 +58,9 @@ def human_size(size: int) -> str:
 
 
 def select_cube_variable(path: Path) -> tuple[str, tuple[int, ...], str]:
+    if path.suffix.lower() == ".npy":
+        array = np.load(path, mmap_mode="r", allow_pickle=False)
+        return "<array>", tuple(int(value) for value in array.shape), str(array.dtype)
     variables = sio.whosmat(path)
     for key in SUPPORTED_KEYS:
         for name, shape, matlab_type in variables:
@@ -82,7 +86,10 @@ def validate_shape(shape: tuple[int, ...], patch_size: int) -> tuple[bool, str]:
 
 
 def load_sample(path: Path, key: str) -> dict[str, object]:
-    cube = np.asarray(sio.loadmat(path)[key]).squeeze()
+    if path.suffix.lower() == ".npy":
+        cube = np.asarray(np.load(path, mmap_mode="r", allow_pickle=False)).squeeze()
+    else:
+        cube = np.asarray(sio.loadmat(path)[key]).squeeze()
     finite = np.isfinite(cube)
     return {
         "loaded_shape": list(cube.shape),
@@ -113,21 +120,23 @@ def inspect_dataset(
         result["compatible"] = False
         return result
 
-    direct_files = sorted(path.glob("*.mat"))
-    recursive_files = sorted(path.rglob("*.mat"))
+    recursive_files = sorted(
+        file
+        for file in path.rglob("*")
+        if file.is_file() and file.suffix.lower() in SUPPORTED_SUFFIXES
+    )
+    direct_files = [file for file in recursive_files if file.parent == path]
     nested_files = [file for file in recursive_files if file.parent != path]
 
-    result["direct_mat_files"] = len(direct_files)
-    result["recursive_mat_files"] = len(recursive_files)
+    result["direct_cube_files"] = len(direct_files)
+    result["recursive_cube_files"] = len(recursive_files)
     result["total_size_bytes"] = sum(file.stat().st_size for file in recursive_files)
 
     if not direct_files:
-        errors.append(
-            "no root-level .mat files; real/train_code/train.py uses Path(path).glob('*.mat')"
-        )
+        errors.append("no root-level .mat or .npy hyperspectral cubes")
         if nested_files:
             warnings.append(
-                f"found {len(nested_files)} nested .mat file(s); pass their parent directory instead"
+                f"found {len(nested_files)} nested .mat/.npy file(s); pass their parent directory instead"
             )
         result["compatible"] = False
         return result
@@ -165,10 +174,10 @@ def inspect_dataset(
 def print_result(result: dict[str, object]) -> None:
     status = "PASS" if result["compatible"] else "FAIL"
     print(f"\n[{status}] {result['name']}: {result['path']}")
-    if "direct_mat_files" in result:
+    if "direct_cube_files" in result:
         print(
-            f"  root-level MAT files: {result['direct_mat_files']}; "
-            f"recursive MAT files: {result['recursive_mat_files']}; "
+            f"  root-level MAT/NPY files: {result['direct_cube_files']}; "
+            f"recursive MAT/NPY files: {result['recursive_cube_files']}; "
             f"total size: {human_size(int(result['total_size_bytes']))}"
         )
     for record in result["files"]:  # type: ignore[union-attr]
