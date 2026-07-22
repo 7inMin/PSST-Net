@@ -21,3 +21,7 @@ snapshot directly and saves each reconstructed cube as a MATLAB file.
 Use `datasets/TSA_real_data/mask.mat` for this experiment. A simulation mask
 or simulation checkpoint is not interchangeable with its real-domain
 counterpart.
+
+Before training, `train_code/check_datasets.py` can validate the CAVE and
+KAIST directory layout, MATLAB variable names, cube dimensions, and optional
+full-file loading without importing the model or initializing CUDA.
