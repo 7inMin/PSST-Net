@@ -49,25 +49,6 @@ echo "GPU:               $GPU"
 echo "Epochs:            $EPOCHS"
 echo "Samples per epoch: $SAMPLES_PER_EPOCH"
 
-"$PYTHON_BIN" -c \
-    "import torch; print('PyTorch:', torch.__version__); print('CUDA:', torch.cuda.is_available()); assert torch.cuda.is_available(), 'CUDA is unavailable'"
-
-# Fast metadata validation for all root-level CAVE and KAIST MAT files.
-"$PYTHON_BIN" "$SCRIPT_DIR/real/train_code/check_datasets.py" \
-    --cave-path "$CAVE_PATH" \
-    --kaist-path "$KAIST_PATH" \
-    --patch-size 384
-
-# Load one real cube, crop it, and synthesize Y/target/Phi before occupying GPU memory.
-"$PYTHON_BIN" "$SCRIPT_DIR/real/train_code/train.py" \
-    --cave-path "$CAVE_PATH" \
-    --kaist-path "$KAIST_PATH" \
-    --mask-path "$MASK_PATH" \
-    --patch-size 384 \
-    --samples-per-epoch 1 \
-    --cache-cubes "$CACHE_CUBES" \
-    --preflight-only
-
 export PYTHONUNBUFFERED=1
 "$PYTHON_BIN" "$SCRIPT_DIR/real/train_code/train.py" \
     --cave-path "$CAVE_PATH" \
